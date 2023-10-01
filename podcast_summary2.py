@@ -2,6 +2,7 @@ from airflow.decorators import dag, task
 
 import pendulum
 
+import json
 import requests
 import xmltodict
 import os
@@ -9,7 +10,12 @@ import os
 from airflow.providers.sqlite.operators.sqlite import SqliteOperator
 from airflow.providers.sqlite.hooks.sqlite import SqliteHook
 
+from vosk import Model, KaldiRecognizer
+from pydub import AudioSegment
+
+PODCAST_URL = "https://www.marketplace.org/feed/podcast/marketplace/"
 EPISODE_FOLDER = "episodes"
+FRAME_RATE = 16000
 
 
 @dag(
@@ -37,8 +43,7 @@ def podcast_summary2():
 
     @task()
     def get_episodes():
-        data = requests.get(
-            "https://www.marketplace.org/feed/podcast/marketplace/")
+        data = requests.get(PODCAST_URL)
         feed = xmltodict.parse(data.text)
         episodes = feed["rss"]["channel"]["item"]
         print(f"Found {len(episodes)} episodes.")
@@ -85,6 +90,34 @@ def podcast_summary2():
         return audio_files  # Returning the audio files
 
     audio_files = download_episodes(podcast_episodes)
+
+    @task()
+    def speech_to_text(audio_files, new_episodes):
+        hook = SqliteHook(sqlite_conn_id="podcasts")
+        untranscribed_episodes = hook.get_pandas_df(
+            "SELECT * from episodes WHERE transcript IS NULL;")
+        model = Model(model_name="vosk-model-en-us-0.22-lgraph")
+        rec = KaldiRecognizer(model, FRAME_RATE)
+        rec.SetWords(True)
+        for index, row in untranscribed_episodes.iterrows():
+            print(f"Transcribing {row['filename']}")
+            filepath = os.path.join(EPISODE_FOLDER, row["filename"])
+            mp3 = AudioSegment.from_mp3(filepath)
+            mp3 = mp3.set_channels(1)
+            mp3 = mp3.set_frame_rate(FRAME_RATE)
+            step = 20000
+            transcript = ""
+            for i in range(0, len(mp3), step):
+                print(f"Progress: {i/len(mp3)}")
+                segment = mp3[i:i+step]
+                rec.AcceptWaveform(segment.raw_data)
+                result = rec.Result()
+                text = json.loads(result)["text"]
+                transcript += text
+            hook.insert_rows(table='episodes', rows=[[row["link"], transcript]], target_fields=[
+                             "link", "transcript"], replace=True)
+
+    speech_to_text(audio_files, new_episodes)
 
 
 summary = podcast_summary2()
